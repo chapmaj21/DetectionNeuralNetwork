@@ -17,7 +17,7 @@ class Dense():
 
         k = math.sqrt(1 / input_size)
         self.weights = np.random.rand(input_size, output_size) * (2 * k) - k
-        self.bias = np.ones((1, output_size))
+        self.bias = np.zeros((1, output_size))
         self.activation = Relu()
 
         super().__init__()
@@ -62,13 +62,13 @@ class DenseManualUpdate():
         self.hidden = None
         self.prev_hidden = None
 
-        # Initialize the weights.  They'll be in the range -sqrt(k) to sqrt(k), where k = 1 / input_size
+        # Initialize the weights. They'll be in the range -sqrt(k) to sqrt(k), where k = 1 / input_size
         np.random.seed(seed)
         k = math.sqrt(1 / input_size)
         self.weights = np.random.rand(input_size, output_size) * (2 * k) - k
 
-        # Our bias will be initialized to 1
-        self.bias = np.ones((1,output_size))
+        # Our bias will be initialized to 0
+        self.bias = np.zeros((1,output_size))
 
     def forward(self, x):
         # Copy the layer input for backprop

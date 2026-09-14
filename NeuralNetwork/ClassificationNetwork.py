@@ -59,7 +59,7 @@ train_data, valid_data = train_test_split(
 
 vectorizer = TfidfVectorizer(
     lowercase=True,
-    max_features=3000,
+    max_features=5000,
     ngram_range=(1, 2),
     min_df=2,
     sublinear_tf=True
@@ -83,22 +83,20 @@ test_y = test_data[["label"]].to_numpy()
 
 net = ClassificationNet(train_x.shape[1])
 
-lr = 0.01
-epochs = 100
+lr = 0.03
+epochs = 1000
+batch_size = 32
 
 for epoch in range(epochs):
     train_loss = 0.0
-
     indices = np.random.permutation(len(train_x))
 
-    for i in indices:
-        x = train_x[i].reshape(1, -1)
-        target = train_y[i].reshape(1, 1)
-
+    for start in range(0, len(indices), batch_size):
+        batch_idx = indices[start:start + batch_size]
+        x = train_x[batch_idx]
+        target = train_y[batch_idx]
         prediction = sigmoid(net.forward(x))
-
-        train_loss += NLL(target, prediction)
-
+        train_loss += NLL(target, prediction) * len(batch_idx)
         grad = prediction - target
         net.backward(grad, lr)
 
@@ -124,7 +122,7 @@ from sklearn.metrics import (
 )
 
 valid_prob = sigmoid(net.forward(valid_x))
-valid_predictions = (valid_prob >= 0.35).astype(int)
+valid_predictions = (valid_prob >= 0.43).astype(int)
 
 print("Accuracy:", accuracy_score(valid_y, valid_predictions))
 print("Precision:", precision_score(valid_y, valid_predictions, zero_division=0))
