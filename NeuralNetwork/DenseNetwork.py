@@ -33,13 +33,13 @@ class Dense():
         self.hidden = x.copy()
         return x
 
-    def backward(self, grad, lr):
+    def backward(self, grad, lr, lambda_reg=0.0):
         if self.add_activation:
             grad = self.activation.backward(grad, self.hidden)
 
         batch_size = self.prev_hidden.shape[0]
 
-        w_grad = self.prev_hidden.T @ grad / batch_size
+        w_grad = self.prev_hidden.T @ grad / batch_size + lambda_reg * self.weights
         b_grad = np.mean(grad, axis=0, keepdims=True)
 
         # Must use the weights from the forward pass

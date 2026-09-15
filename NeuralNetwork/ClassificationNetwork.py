@@ -31,8 +31,8 @@ class ClassificationNet:
     def forward(self, x):
         return self.output.forward(x)
 
-    def backward(self, grad, lr):
-        self.output.backward(grad, lr)
+    def backward(self, grad, lr, lambda_reg):
+        self.output.backward(grad, lr, lambda_reg)
 
 np.random.seed(0)
 
@@ -59,9 +59,9 @@ train_data, valid_data = train_test_split(
 
 vectorizer = TfidfVectorizer(
     lowercase=True,
-    max_features=5000,
+    max_features=10000,
     ngram_range=(1, 2),
-    min_df=2,
+    min_df = 2,
     sublinear_tf=True
 )
 
@@ -86,6 +86,7 @@ net = ClassificationNet(train_x.shape[1])
 lr = 0.03
 epochs = 1000
 batch_size = 32
+lambda_reg = 1e-4
 
 for epoch in range(epochs):
     train_loss = 0.0
@@ -98,7 +99,7 @@ for epoch in range(epochs):
         prediction = sigmoid(net.forward(x))
         train_loss += NLL(target, prediction) * len(batch_idx)
         grad = prediction - target
-        net.backward(grad, lr)
+        net.backward(grad, lr, lambda_reg)
 
     train_loss /= len(train_x)
 
@@ -122,7 +123,23 @@ from sklearn.metrics import (
 )
 
 valid_prob = sigmoid(net.forward(valid_x))
-valid_predictions = (valid_prob >= 0.43).astype(int)
+best_threshold = 0.0
+best_f1 = 0.0
+
+for threshold in np.arange(0.20, 0.80, 0.01):
+    preds = (valid_prob >= threshold).astype(int)
+
+    score = f1_score(
+        valid_y,
+        preds,
+        zero_division=0
+    )
+
+    if score > best_f1:
+        best_f1 = score
+        best_threshold = threshold
+
+valid_predictions = (valid_prob >= best_threshold).astype(int)
 
 print("Accuracy:", accuracy_score(valid_y, valid_predictions))
 print("Precision:", precision_score(valid_y, valid_predictions, zero_division=0))
