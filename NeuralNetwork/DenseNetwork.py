@@ -15,16 +15,18 @@ class Dense():
         self.hidden = None
         self.prev_hidden = None
 
-        k = math.sqrt(1 / input_size)
-        self.weights = np.random.rand(input_size, output_size) * (2 * k) - k
-        self.bias = np.zeros((1, output_size))
-        self.activation = Relu()
+        self.weights = (
+            np.random.randn(input_size, output_size)
+            * np.sqrt(2 / input_size)
+        ).astype(np.float32)
+        self.bias = np.zeros((1, output_size), dtype=np.float32)
+        self.activation = Relu()    
 
         super().__init__()
 
     def forward(self, x):
         self.prev_hidden = x.copy()
-        x = np.matmul(x, self.weights)
+        x = x @ self.weights
         if self.add_bias:
             x += self.bias
 
@@ -33,17 +35,24 @@ class Dense():
         self.hidden = x.copy()
         return x
 
-    def backward(self, grad, lr, lambda_reg=0.0):
+    def backward(self, grad, lr, lambda_reg=0.0, calculate_prev_grad=True):
         if self.add_activation:
             grad = self.activation.backward(grad, self.hidden)
 
         batch_size = self.prev_hidden.shape[0]
 
-        w_grad = self.prev_hidden.T @ grad / batch_size + lambda_reg * self.weights
+        # Parameter gradients averaged across batch
+        w_grad = self.prev_hidden.T @ grad / batch_size
         b_grad = np.mean(grad, axis=0, keepdims=True)
 
-        # Must use the weights from the forward pass
-        prev_grad = grad @ self.weights.T
+        # L2 regularisation
+        w_grad += lambda_reg * self.weights
+
+        # Gradient passed backwards is NOT averaged
+        if calculate_prev_grad: 
+            prev_grad = grad @ self.weights.T
+        else:
+            prev_grad = None
 
         self.weights -= lr * w_grad
 
@@ -64,7 +73,6 @@ class DenseManualUpdate():
 
         # Initialize the weights. They'll be in the range -sqrt(k) to sqrt(k), where k = 1 / input_size
         np.random.seed(seed)
-        k = math.sqrt(1 / input_size)
         self.weights = np.random.rand(input_size, output_size) * (2 * k) - k
 
         # Our bias will be initialized to 0
