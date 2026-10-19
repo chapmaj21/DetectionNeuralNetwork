@@ -1,41 +1,59 @@
 import numpy as np
-import math
 
-class Relu():
+
+class Relu:
     def forward(self, x):
         return np.maximum(0, x)
 
     def backward(self, grad, hidden):
+        # Gradient passes only where the unit fired (output > 0 exactly when input > 0).
         return grad * (hidden > 0)
 
-class Dense():
-    def __init__(self, input_size, output_size, bias=True, activation=True, seed=0):
+
+class Dense:
+    """Fully connected layer: output = activation(x @ W + b).
+
+    Works with dense NumPy arrays or SciPy sparse matrices as input.
+    """
+
+    def __init__(self, input_size, output_size, bias=True, activation=True, dtype=np.float32):
         self.add_bias = bias
         self.add_activation = activation
+        self.activation = Relu()
+
+        # Cached by forward() for use in backward(); grads are set by backward().
         self.hidden = None
         self.prev_hidden = None
+        self.grads = None
 
+        # He initialisation: N(0, 2 / fan_in), designed for ReLU layers.
+        # Uses NumPy's global random state, seeded once in the training script.
         self.weights = (
             np.random.randn(input_size, output_size)
             * np.sqrt(2 / input_size)
-        ).astype(np.float32)
-        self.bias = np.zeros((1, output_size), dtype=np.float32)
-        self.activation = Relu()    
-
-        super().__init__()
+        ).astype(dtype)
+        self.bias = np.zeros((1, output_size), dtype=dtype)
 
     def forward(self, x):
-        self.prev_hidden = x.copy()
+        # Stored by reference: nothing modifies these arrays in place, so no copies are needed.
+        self.prev_hidden = x
         x = x @ self.weights
         if self.add_bias:
             x += self.bias
 
         if self.add_activation:
             x = self.activation.forward(x)
-        self.hidden = x.copy()
+        self.hidden = x
         return x
 
-    def backward(self, grad, lr, lambda_reg=0.0, calculate_prev_grad=True):
+    def params(self):
+        return [self.weights, self.bias] if self.add_bias else [self.weights]
+
+    def backward(self, grad, lambda_reg=0.0, calculate_prev_grad=True):
+        """Compute parameter gradients (stored in self.grads) and return dL/d(input).
+
+        This only computes gradients; an optimiser such as SGD applies them.
+        """
         if self.add_activation:
             grad = self.activation.backward(grad, self.hidden)
 
@@ -45,86 +63,29 @@ class Dense():
         w_grad = self.prev_hidden.T @ grad / batch_size
         b_grad = np.mean(grad, axis=0, keepdims=True)
 
-        # L2 regularisation
+        # L2 regularisation (weights only)
         w_grad += lambda_reg * self.weights
 
+        # Same order as params()
+        self.grads = [w_grad, b_grad] if self.add_bias else [w_grad]
+
         # Gradient passed backwards is NOT averaged
-        if calculate_prev_grad: 
-            prev_grad = grad @ self.weights.T
-        else:
-            prev_grad = None
-
-        self.weights -= lr * w_grad
-
-        if self.add_bias:
-            self.bias -= lr * b_grad
-
-        return prev_grad
+        if calculate_prev_grad:
+            return grad @ self.weights.T
+        return None
 
 
-class DenseManualUpdate():
+class SGD:
+    """Plain stochastic gradient descent: p <- p - lr * gradient.
+
+    Kept separate from the layers so the update rule can be changed
+    (e.g. to momentum) without editing any layer code.
     """
-    Dense layer, but we manually update the weights and bias externally.
-    """
-    def __init__(self, input_size, output_size, dropout=None, activation=True, seed=0):
-        self.add_activation = activation
-        self.hidden = None
-        self.prev_hidden = None
 
-        # Initialize the weights. They'll be in the range -sqrt(k) to sqrt(k), where k = 1 / input_size
-        np.random.seed(seed)
-        self.weights = np.random.rand(input_size, output_size) * (2 * k) - k
+    def __init__(self, lr):
+        self.lr = lr
 
-        # Our bias will be initialized to 0
-        self.bias = np.zeros((1,output_size))
-
-    def forward(self, x):
-        # Copy the layer input for backprop
-        self.prev_hidden = x.copy()
-        # Multiply the input by the weights, then add the bias
-        x = np.matmul(x, self.weights) + self.bias
-        # Apply the activation function
-        if self.add_activation:
-            x = np.maximum(x, 0)
-        # Copy the layer output for backprop
-        self.hidden = x.copy()
-        return x
-
-    def backward(self, grad):
-        # "Undo" the activation function if it was added
-        if self.add_activation:
-            grad = np.multiply(grad, np.heaviside(self.hidden, 0))
-
-        # Calculate the parameter gradients
-        w_grad = self.prev_hidden.T @ grad # This is not averaged across the batch, due to the way matrix multiplication sums
-        b_grad = np.mean(grad, axis=0) # This is averaged across the batch
-        param_grads = [w_grad, b_grad]
-
-        # Calculate the next layer gradient
-        grad = grad @ self.weights.T
-        return param_grads, grad
-
-    def update(self, w_grad, b_grad):
-        # Update the weights given an update matrix
-        self.weights += w_grad
-        self.bias += b_grad
-
-
-def forward(x, layers, training=True):
-    # Loop through each layer
-    for layer in layers:
-        # Run the forward pass
-        layer.training = training
-        x = layer.forward(x)
-    return x
-
-
-def backward(grad, layers):
-    # Save the gradients for each layer
-    layer_grads = []
-    # Loop through each layer in reverse order (starting from the output layer)
-    for layer in reversed(layers):
-        # Get the parameter gradients and the next layer gradient
-        param_grads, grad = layer.backward(grad)
-        layer_grads.append(param_grads)
-    return layer_grads
+    def step(self, layers):
+        for layer in layers:
+            for param, grad in zip(layer.params(), layer.grads):
+                param -= self.lr * grad

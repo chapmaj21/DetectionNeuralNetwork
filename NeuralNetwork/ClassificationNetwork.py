@@ -1,19 +1,49 @@
-import copy
+﻿"""Toxic comment classifier: TF-IDF features + a small neural network in NumPy.
+
+Run from anywhere:  python NeuralNetwork/ClassificationNetwork.py
+"""
+
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-
-from DenseNetwork import Dense
-
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score,
+    confusion_matrix,
+    f1_score,
     precision_score,
     recall_score,
-    f1_score,
-    confusion_matrix
 )
+from sklearn.model_selection import train_test_split
 
+from DenseNetwork import SGD, Dense
+
+
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+
+DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "train.csv"
+
+SEED = 0
+SUBSAMPLE = 150000           # comments to use, out of 159,571 (must be smaller than that); 30000 for quick runs
+HIDDEN_SIZES = [16]          # e.g. [32, 8] for two hidden layers
+
+# TF-IDF inputs are sparse (~66 non-zero values per comment), so each weight gets
+# few, small gradients and needs a much larger step than dense data would.
+LR = 0.1
+EPOCHS = 2000
+BATCH_SIZE = 512
+LAMBDA_REG = 1e-4
+
+VALIDATION_INTERVAL = 10     # check validation loss every this many epochs
+PATIENCE = 100               # stop after this many epochs without improvement
+
+
+# --------------------------------------------------
+# Activation and loss
+# --------------------------------------------------
 
 def sigmoid(x):
     x = np.clip(x, -500, 500)
@@ -25,288 +55,223 @@ def NLL(y, y_pred):
     return float(np.mean(-(y * np.log(y_pred) + (1 - y) * np.log(1 - y_pred))))
 
 
+# --------------------------------------------------
+# Model
+# --------------------------------------------------
+
 class ClassificationNet:
-    def __init__(self, input_size):
+    def __init__(self, input_size, hidden_sizes=(16,), dtype=np.float32):
+        # Hidden layers use ReLU; the output layer returns a logit (sigmoid applied outside).
+        sizes = [input_size, *hidden_sizes, 1]
+        n_layers = len(sizes) - 1
         self.layers = [
-            Dense(input_size, 16, activation=True),
-            # Dense(32, 8, activation=True),
-            Dense(16, 1, activation=False)
+            Dense(sizes[i], sizes[i + 1], activation=(i < n_layers - 1), dtype=dtype)
+            for i in range(n_layers)
         ]
 
     def forward(self, x):
         for layer in self.layers:
             x = layer.forward(x)
-
         return x
 
-    def backward(self, grad, lr, lambda_reg):
+    def backward(self, grad, lambda_reg):
+        """Compute gradients for every layer. An optimiser applies them afterwards."""
         for i in range(len(self.layers) - 1, -1, -1):
-            grad = self.layers[i].backward(grad, lr, lambda_reg, calculate_prev_grad=(i != 0))
+            # The first layer's input gradient is never used, so skip computing it.
+            grad = self.layers[i].backward(grad, lambda_reg, calculate_prev_grad=(i != 0))
 
     def get_params(self):
         return [(layer.weights.copy(), layer.bias.copy()) for layer in self.layers]
 
     def set_params(self, params):
-        for layer, (weights, bias) in zip(self.layers,params):
+        for layer, (weights, bias) in zip(self.layers, params):
             layer.weights = weights.copy()
             layer.bias = bias.copy()
 
 
 # --------------------------------------------------
-# Reproducibility
+# Data
 # --------------------------------------------------
 
-np.random.seed(0)
+def load_data():
+    data = pd.read_csv(DATA_PATH)
+    data = data.rename(columns={"comment_text": "comment"})
+    data["label"] = data["toxic"].astype(float)
+
+    data, _ = train_test_split(
+        data,
+        train_size=SUBSAMPLE,
+        random_state=SEED,
+        stratify=data["label"]
+    )
+    return data
 
 
-# --------------------------------------------------
-# Load dataset
-# --------------------------------------------------
+def split_data(data):
+    """70% training / 10% validation / 5% threshold tuning / 15% test, all stratified by label.
 
-data = pd.read_csv("../data/train.csv")
-data = data.rename(columns={"comment_text": "comment"})
-data["label"] = data["toxic"].astype(float)
-
-data, _ = train_test_split(
-    data,
-    train_size=30000,
-    random_state=0,
-    stratify=data["label"]
-)
-
-
-# --------------------------------------------------
-# Train / validation / test split
-#
-# 70% training
-# 15% validation
-# 15% test
-# --------------------------------------------------
-
-train_valid_data, test_data = train_test_split(
-    data,
-    test_size=0.15,
-    random_state=0,
-    stratify=data["label"]
-)
-
-train_data, valid_data = train_test_split(
-    train_valid_data,
-    test_size=0.1765,
-    random_state=0,
-    stratify=train_valid_data["label"]
-)
+    Validation picks the epoch (early stopping) and a separate tuning set picks the
+    decision threshold, so neither choice is fitted to the data used to judge the other.
+    """
+    train_valid_data, test_data = train_test_split(
+        data,
+        test_size=0.15,
+        random_state=SEED,
+        stratify=data["label"]
+    )
+    # 17.65% of the remaining 85% is 15% of the whole dataset (0.15 / 0.85 ≈ 0.1765).
+    train_data, holdout_data = train_test_split(
+        train_valid_data,
+        test_size=0.1765,
+        random_state=SEED,
+        stratify=train_valid_data["label"]
+    )
+    # Split that 15% into 10% validation and 5% threshold tuning.
+    valid_data, tune_data = train_test_split(
+        holdout_data,
+        test_size=1 / 3,
+        random_state=SEED,
+        stratify=holdout_data["label"]
+    )
+    return train_data, valid_data, tune_data, test_data
 
 
-print("Training examples:", len(train_data))
-print("Validation examples:", len(valid_data))
-print("Test examples:", len(test_data))
+def make_vectorizer():
+    return TfidfVectorizer(
+        lowercase=True,
+        max_features=20000,
+        ngram_range=(1, 2),
+        min_df=3,
+        sublinear_tf=True,
+        dtype=np.float32
+    )
 
 
-# --------------------------------------------------
-# TF-IDF
-# --------------------------------------------------
+def labels(df):
+    return df[["label"]].to_numpy(dtype=np.float32)
 
-vectorizer = TfidfVectorizer(
-    lowercase=True,
-    max_features=20000,
-    ngram_range=(1, 2),
-    min_df=3,
-    sublinear_tf=True,
-    dtype=np.float32
-)
-#--------------------------------------------------
-# Split data into training, validation and test sets
-#--------------------------------------------------
-
-train_x = vectorizer.fit_transform(train_data["comment"])
-valid_x = vectorizer.transform(valid_data["comment"])
-test_x = vectorizer.transform(test_data["comment"])
-
-train_y = train_data[["label"]].to_numpy(dtype=np.float32)
-valid_y = valid_data[["label"]].to_numpy(dtype=np.float32)
-test_y = test_data[["label"]].to_numpy(dtype=np.float32)
-
-print("Number of TF-IDF features:", train_x.shape[1])
-
-
-# --------------------------------------------------
-# Initialise network
-# --------------------------------------------------
-
-net = ClassificationNet(train_x.shape[1])
-
-# --------------------------------------------------
-# Hyperparameters
-# --------------------------------------------------
-
-lr = 0.003
-epochs = 2000
-batch_size = 512
-lambda_reg = 1e-4
-
-# Validation is checked every 10 epochs.
-validation_interval = 10
-
-# Stop if validation loss has not improved
-# for this many epochs.
-patience = 100
-
-# --------------------------------------------------
-# Early stopping variables
-# --------------------------------------------------
-
-best_valid_loss = float("inf")
-best_params = None
-best_epoch = 0
-epochs_without_improvement = 0
 
 # --------------------------------------------------
 # Training
 # --------------------------------------------------
 
-for epoch in range(epochs):
-    train_loss = 0.0
+def train(net, train_x, train_y, valid_x, valid_y):
+    optimizer = SGD(LR)
 
-    # Shuffle training examples each epoch
-    indices = np.random.permutation(
-        train_x.shape[0]
-    )
-    # ----------------------------------------------
-    # Mini-batch gradient descent
-    # ----------------------------------------------
-    for start in range(0, len(indices), batch_size):
-        batch_idx = indices[start:start + batch_size]
-        x = train_x[batch_idx]
-        target = train_y[batch_idx]
+    best_valid_loss = float("inf")
+    best_params = None
+    best_epoch = 0
+    epochs_without_improvement = 0
 
-        # Forward pass
-        logits = net.forward(x)
-        prediction = sigmoid(logits)
+    for epoch in range(EPOCHS):
+        # Shuffle training examples each epoch
+        indices = np.random.permutation(train_x.shape[0])
 
-        # Calculate batch loss
-        train_loss += (NLL(target, prediction)* len(batch_idx))
+        # Mini-batch gradient descent
+        for start in range(0, len(indices), BATCH_SIZE):
+            batch_idx = indices[start:start + BATCH_SIZE]
+            x = train_x[batch_idx]
+            target = train_y[batch_idx]
 
-        # BCE + sigmoid derivative
-        #
-        # dL / d(logit)
-        grad = prediction - target
+            prediction = sigmoid(net.forward(x))
 
-        # Backpropagation
-        net.backward(grad, lr, lambda_reg)
+            # BCE + sigmoid derivative: dL / d(logit) = prediction - target
+            grad = prediction - target
+            net.backward(grad, LAMBDA_REG)
+            optimizer.step(net.layers)
 
-    train_loss /= train_x.shape[0]
+        if epoch % VALIDATION_INTERVAL == 0:
+            # Both losses are measured after the epoch with the same fixed weights,
+            # so they are directly comparable.
+            train_loss = NLL(train_y, sigmoid(net.forward(train_x)))
+            valid_loss = NLL(valid_y, sigmoid(net.forward(valid_x)))
+            print(f"Epoch {epoch:4d} | train loss: {train_loss:.4f} | valid loss: {valid_loss:.4f}")
 
+            # Save the best model; stop if validation loss hasn't improved for PATIENCE epochs.
+            if valid_loss < best_valid_loss:
+                best_valid_loss = valid_loss
+                best_epoch = epoch
+                best_params = net.get_params()
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += VALIDATION_INTERVAL
 
-    # ----------------------------------------------
-    # Validation
-    # ----------------------------------------------
+            if epochs_without_improvement >= PATIENCE:
+                print(f"\nEarly stopping at epoch {epoch}")
+                break
 
-    if epoch % validation_interval == 0:
-        valid_logits = net.forward(valid_x)
-        valid_prediction = sigmoid(valid_logits)
-        valid_loss = NLL(valid_y,valid_prediction)
-        print(
-            f"Epoch {epoch:4d} | "
-            f"train loss: {train_loss:.4f} | "
-            f"valid loss: {valid_loss:.4f}"
-        )
+    # Restore the best network
+    if best_params is not None:
+        net.set_params(best_params)
 
-        # ------------------------------------------
-        # Save best model
-        # ------------------------------------------
-
-        if valid_loss < best_valid_loss:
-            best_valid_loss = valid_loss
-            best_epoch = epoch
-            best_params = net.get_params()
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += (validation_interval)
-
-        # ------------------------------------------
-        # Early stopping
-        # ------------------------------------------
-
-        if (epochs_without_improvement >= patience):
-            print()
-            print(f"Early stopping at epoch {epoch}")
-            break
+    print(f"\nBest validation loss: {best_valid_loss:.4f}")
+    print(f"Best epoch: {best_epoch}")
+    return net
 
 
 # --------------------------------------------------
-# Restore best network
+# Evaluation
 # --------------------------------------------------
 
-if best_params is not None:
-    net.set_params(best_params)
+def choose_threshold(y, prob):
+    """Pick the decision threshold with the best F1. Use the tuning set only, never test."""
+    best_threshold = 0.5
+    best_f1 = 0.0
+    for threshold in np.arange(0.01, 0.81, 0.01):
+        score = f1_score(y, (prob >= threshold).astype(int), zero_division=0)
+        if score > best_f1:
+            best_f1 = score
+            best_threshold = threshold
+    return best_threshold, best_f1
 
-print()
-print(f"Best validation loss: " f"{best_valid_loss:.4f}")
-print(f"Best epoch: {best_epoch}")
 
-
-# --------------------------------------------------
-# Find best classification threshold
-#
-# IMPORTANT:
-# Threshold is chosen using validation data only.
-# --------------------------------------------------
-
-valid_prob = sigmoid(net.forward(valid_x))
-
-best_threshold = 0.5
-best_valid_f1 = 0.0
-
-for threshold in np.arange(0.01, 0.81, 0.01):
-    predictions = (valid_prob >= threshold).astype(int)
-    score = f1_score(valid_y, predictions, zero_division=0)
-    if score > best_valid_f1:
-        best_valid_f1 = score
-        best_threshold = threshold
-
-print()
-print(f"Best threshold: " f"{best_threshold:.2f}")
-print(f"Validation F1: " f"{best_valid_f1:.4f}")
+def report(title, y, prob, threshold):
+    predictions = (prob >= threshold).astype(int)
+    print(f"\n{title}")
+    print("-" * len(title))
+    print("Accuracy:", accuracy_score(y, predictions))
+    print("Precision:", precision_score(y, predictions, zero_division=0))
+    print("Recall:", recall_score(y, predictions, zero_division=0))
+    print("F1:", f1_score(y, predictions, zero_division=0))
+    print("Confusion matrix:")
+    print(confusion_matrix(y, predictions))
 
 
 # --------------------------------------------------
-# Validation metrics
+# Main
 # --------------------------------------------------
 
-valid_predictions = (
-    valid_prob >= best_threshold
-).astype(int)
+def main():
+    np.random.seed(SEED)  # reproducible weight initialisation and shuffling
+
+    data = load_data()
+    train_data, valid_data, tune_data, test_data = split_data(data)
+    print("Training examples:", len(train_data))
+    print("Validation examples:", len(valid_data))
+    print("Threshold tuning examples:", len(tune_data))
+    print("Test examples:", len(test_data))
+
+    # Fit the vocabulary and IDF on training data only, to avoid leakage.
+    vectorizer = make_vectorizer()
+    train_x = vectorizer.fit_transform(train_data["comment"])
+    valid_x = vectorizer.transform(valid_data["comment"])
+    tune_x = vectorizer.transform(tune_data["comment"])
+    test_x = vectorizer.transform(test_data["comment"])
+    train_y, valid_y = labels(train_data), labels(valid_data)
+    tune_y, test_y = labels(tune_data), labels(test_data)
+    print("Number of TF-IDF features:", train_x.shape[1])
+
+    net = ClassificationNet(train_x.shape[1], HIDDEN_SIZES)
+    net = train(net, train_x, train_y, valid_x, valid_y)
+
+    tune_prob = sigmoid(net.forward(tune_x))
+    threshold, tune_f1 = choose_threshold(tune_y, tune_prob)
+    print(f"\nBest threshold (from tuning set): {threshold:.2f}")
+    print(f"Tuning set F1: {tune_f1:.4f}")
+
+    report("VALIDATION RESULTS", valid_y, sigmoid(net.forward(valid_x)), threshold)
+    report("TEST RESULTS", test_y, sigmoid(net.forward(test_x)), threshold)
 
 
-print()
-print("VALIDATION RESULTS")
-print("------------------")
-
-print("Accuracy:", accuracy_score(valid_y, valid_predictions))
-print("Precision:", precision_score(valid_y, valid_predictions, zero_division=0))
-print("Recall:", recall_score(valid_y, valid_predictions, zero_division=0))
-print("F1:", f1_score(valid_y, valid_predictions, zero_division=0))
-
-print("Confusion matrix:")
-print(confusion_matrix(valid_y, valid_predictions))
-
-
-# --------------------------------------------------
-# Final evaluation
-# --------------------------------------------------
-
-test_prob = sigmoid(net.forward(test_x))
-test_predictions = (test_prob >= best_threshold).astype(int)
-
-print()
-print("TEST RESULTS")
-print("------------")
-
-print("Accuracy:", accuracy_score(test_y, test_predictions))
-print("Precision:", precision_score(test_y, test_predictions, zero_division=0))
-print("Recall:", recall_score(test_y, test_predictions, zero_division=0))
-print("F1:", f1_score(test_y, test_predictions, zero_division=0))
-
-print("Confusion matrix:")
-print(confusion_matrix(test_y, test_predictions))
+if __name__ == "__main__":
+    main()
